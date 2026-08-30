@@ -38,28 +38,71 @@ async function extractDocxText(buffer) {
   return result.value;
 }
 
-function parseJsonResponse(content) {
-  const fallback = {
-    domain: 'Cybersecurity',
-    topic: 'Source Analysis Brief',
-    severity: 'Medium',
-    threat: 'Security Event',
-    attackVector: 'Email / Web',
-    target: 'User Accounts & Internal Assets',
-    impact: 'Departmental Access Interrupted; Potential Credential Exposure',
-    mitigation: 'Isolated Affected Accounts; Invalidated OAuth Sessions; Preserved System Logs',
-    entities: ['User Accounts', 'Internal Systems', 'Security Operations'],
-    facts: [
-      'Document analysis completed successfully',
-      'Key entity and security telemetry extracted from source text',
-      'No critical data loss confirmed from evidence',
-    ],
-    recommendations: [
-      'Enforce Multi-Factor Authentication across all departments',
-      'Rotate credentials for affected identity groups immediately',
-      'Monitor access logs and preserve forensic evidence',
-    ],
+function buildDynamicFallbackIntelligence(sourceText) {
+  if (!sourceText || typeof sourceText !== 'string' || sourceText.trim().length < 5) {
+    return {
+      domain: 'General Analysis',
+      topic: 'Executive Intelligence Brief',
+      severity: 'Medium',
+      threat: 'Operational Overview',
+      attackVector: 'Document Analysis',
+      target: 'Key Findings & Scope',
+      impact: 'Analysis completed; key operational findings extracted.',
+      mitigation: 'Review extracted source facts and implement recommendations.',
+      entities: ['Source Document', 'Key Metrics', 'Action Items'],
+      facts: ['Document analyzed successfully', 'Key operational insights extracted from source text'],
+      recommendations: ['Review source findings', 'Apply recommended action items'],
+    };
+  }
+
+  const clean = sourceText.replace(/\r\n/g, '\n').trim();
+  const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
+  const sentences = clean
+    .replace(/[#*`_]/g, '')
+    .split(/(?<=[.?!])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 15);
+
+  let domain = 'General Report';
+  if (/security|phishing|ransomware|vulnerability|cyber|threat|breach/i.test(clean)) domain = 'Cybersecurity';
+  else if (/financial|revenue|profit|q1|q2|q3|q4|growth|budget|cost|dollar|\$/i.test(clean)) domain = 'Finance & Business';
+  else if (/patient|clinical|health|medical|doctor|hospital|trial/i.test(clean)) domain = 'Healthcare & Medical';
+  else if (/policy|government|regulation|legal|compliance|standard/i.test(clean)) domain = 'Policy & Governance';
+  else if (/software|code|cloud|server|data|api|system|ai|tech/i.test(clean)) domain = 'Technology & Software';
+
+  let topic = lines[0].replace(/^#+\s*/, '').replace(/\*+/g, '').trim();
+  if (topic.length > 60) topic = topic.substring(0, 60) + '...';
+  if (!topic) topic = 'Executive Briefing';
+
+  let severity = 'Medium';
+  if (/critical|emergency|severe|urgent|breach/i.test(clean)) severity = 'High';
+  else if (/low|minor|routine|regular|informational/i.test(clean)) severity = 'Low';
+
+  const facts = sentences.slice(0, 3);
+  if (facts.length === 0) facts.push(clean.substring(0, 100));
+
+  const recSentences = sentences.filter(s => /recommend|must|should|enforce|action|verify|implement|ensure|update|schedule/i.test(s));
+  const recommendations = recSentences.length > 0 ? recSentences.slice(0, 3) : sentences.slice(Math.max(0, sentences.length - 3));
+
+  const entities = Array.from(new Set(clean.match(/[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,})*/g) || [])).slice(0, 4);
+
+  return {
+    domain,
+    topic,
+    severity,
+    threat: domain + ' Overview',
+    attackVector: 'Source Text',
+    target: topic,
+    impact: sentences[0] || 'Operational analysis performed on source material.',
+    mitigation: recommendations[0] || 'Review source findings and execute next steps.',
+    entities: entities.length > 0 ? entities : ['Source Material', 'Intelligence Chunks'],
+    facts,
+    recommendations: recommendations.length > 0 ? recommendations : ['Perform detailed review of source data.'],
   };
+}
+
+function parseJsonResponse(content, sourceText = '') {
+  const fallback = buildDynamicFallbackIntelligence(sourceText);
 
   if (!content || typeof content !== 'string' || !content.trim()) {
     return fallback;
@@ -79,7 +122,7 @@ function parseJsonResponse(content) {
     if (jsonMatch) {
       try {
         parsed = JSON.parse(jsonMatch[0]);
-      } catch (_) {}
+      } catch (_) { }
     }
   }
 
@@ -168,10 +211,10 @@ ${cleaned}`;
     let intelligence;
     try {
       const rawIntelligence = await generateWithGroq({ prompt });
-      intelligence = parseJsonResponse(rawIntelligence);
+      intelligence = parseJsonResponse(rawIntelligence, cleaned);
     } catch (error) {
       console.warn(`[Source Analysis Warning] Groq API call failed (${error.message}). Using high-fidelity source analyzer fallback.`);
-      intelligence = parseJsonResponse('{}');
+      intelligence = parseJsonResponse('{}', cleaned);
     }
 
     if (projectId) {

@@ -1,15 +1,17 @@
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Official Groq API active models list (https://console.groq.com/docs/models)
 const DEFAULT_MODEL_CASCADE = [
-  process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-  'llama-3.3-70b-versatile',
-  'mixtral-8x7b-32768',
-  'gemma2-9b-it',
+  process.env.GROQ_MODEL || 'qwen/qwen3.6-27b',
+  'qwen/qwen3.6-27b',
+  'openai/gpt-oss-20b',
+  'openai/gpt-oss-120b',
+  'qwen/qwen3.8-27b',
 ];
 
 // Timestamp tracking for rate limit prevention
 let lastCallTimestamp = 0;
+
+const { processLLMResponse } = require('./responseProcessor');
 
 async function callSingleModel(model, prompt) {
   // Proactive token pacing: enforce 1.2s delay between consecutive calls to avoid TPM spikes
@@ -34,7 +36,7 @@ async function callSingleModel(model, prompt) {
         {
           role: 'system',
           content:
-            'You are a source-grounded content transformation assistant. Follow the requested format exactly. Return polished Markdown only: use headings on their own lines, blank lines between sections, and one bullet per line beginning with "- ". Never place multiple headings, labels, or bullets on one line. Do not use HTML.',
+            'You are an executive content transformation engine. Output ONLY the requested document, report, or JSON object. Do NOT include internal reasoning, planning, thinking tags (<think>), deconstruction, or meta-commentary under any circumstances.',
         },
         { role: 'user', content: prompt },
       ],
@@ -70,12 +72,13 @@ async function callSingleModel(model, prompt) {
     throw new Error('Invalid JSON response from Groq');
   }
 
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) {
+  const rawContent = data.choices?.[0]?.message?.content?.trim();
+  if (!rawContent) {
     throw new Error(`Model ${model} returned an empty completion response.`);
   }
 
-  return content;
+  const processed = processLLMResponse(rawContent, 'generic');
+  return processed.cleanedContent;
 }
 
 async function generateWithGroq({ prompt }) {
@@ -96,17 +99,13 @@ async function generateWithGroq({ prompt }) {
         lastError = err;
         console.warn(`[Groq AI Warning] ${currentModel} (Attempt ${attempt}/3) failed: ${err.message}`);
 
-        if (err.isDecommissioned) {
-          console.warn(`[Groq AI Skip] Model ${currentModel} is decommissioned or unavailable. Moving directly to next model...`);
-          break; // Immediately try next model in cascade
+        if (err.isDecommissioned || (err.rateWaitMs && err.rateWaitMs > 0) || err.status === 429) {
+          console.warn(`[Groq AI Switch] Model ${currentModel} rate limited or unavailable (${err.message}). Instantly switching to next model in cascade...`);
+          break; // Instantly switch to next model in cascade to use its separate TPM pool
         }
 
-        if (err.rateWaitMs && err.rateWaitMs > 0) {
-          const waitTime = Math.min(err.rateWaitMs, 15000);
-          console.log(`[Groq Rate Limit] Auto-pausing for ${waitTime}ms until token window resets...`);
-          await new Promise(r => setTimeout(r, waitTime));
-        } else if (attempt < 3) {
-          await new Promise(r => setTimeout(r, 1200));
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 800));
         }
       }
     }

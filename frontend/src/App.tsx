@@ -152,23 +152,23 @@ export const defaultEvaluation: EvaluationResult = {
   missingInformation: [],
 }
 
-export const mockIntelligence: Project['intelligence'] = {
-  domain: 'Cybersecurity',
-  topic: 'Phishing Campaign',
+export const emptyIntelligence: Project['intelligence'] = {
+  domain: 'General Analysis',
+  topic: 'Source Analysis Brief',
   severity: 'Medium',
-  threat: 'Phishing',
-  attackVector: 'Email',
-  target: 'Employee Accounts',
-  impact: 'Credential Compromise',
-  mitigation: 'MFA + Password Reset',
-  entities: ['Employee Accounts', 'Internal Systems'],
-  facts: ['500 employees targeted', '20 employees clicked malicious link', '3 credentials compromised'],
-  recommendations: ['Reset credentials', 'Enable MFA', 'Conduct training'],
+  threat: 'Operational Review',
+  attackVector: 'Source Text',
+  target: 'Key Findings',
+  impact: 'Pending Source Text Analysis',
+  mitigation: 'Pending Source Text Analysis',
+  entities: [],
+  facts: [],
+  recommendations: [],
 }
 
 export const emptyProject: Project = {
   source: { fileName: '', fileType: '', file: null, extractedText: '', status: 'idle' },
-  intelligence: mockIntelligence,
+  intelligence: emptyIntelligence,
   configuration: {
     outputs: [],
     audience: '',
@@ -261,7 +261,7 @@ export default function App() {
             extractedText: p.extractedText,
             status: 'completed',
           },
-          intelligence: p.intelligence || mockIntelligence,
+          intelligence: p.intelligence || emptyIntelligence,
           configuration: {
             outputs: Object.keys(outputsMap),
             audience: 'Leadership',

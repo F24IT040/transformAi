@@ -1,5 +1,10 @@
-import { useState, type Dispatch, type SetStateAction } from 'react'
+import { useState, useRef, type Dispatch, type SetStateAction } from 'react'
 import type { Project, SourceReference, EvaluationResult, IterationStep } from '../App'
+import { parseInfographicData } from '../components/infographic/types'
+import { InfographicPreview } from '../components/infographic/InfographicPreview'
+import { InfographicEditor } from '../components/infographic/InfographicEditor'
+import { InfographicExport } from '../components/infographic/InfographicExport'
+import { toPng } from 'html-to-image'
 
 type Props = {
   project: Project
@@ -14,18 +19,54 @@ const labels: Record<string, string> = {
   advisory: 'Advisory',
   presentation: 'Presentation',
   twitter: 'Twitter/X Thread',
-  infographic: 'Infographic Brief',
+  infographic: 'Infographic (Visual Poster)',
   video_package: 'Video Package Brief',
 }
 
 function StructuredContent({ content }: { content: string }) {
-  const normalized = content
+  // Clean internal reasoning <think>...</think> blocks from Qwen/DeepSeek models
+  let cleanContent = (content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+
+  // If content is a raw JSON string, convert it into clean Markdown report text
+  if (cleanContent.startsWith('{') || cleanContent.startsWith('```json') || (cleanContent.includes('"title":') && cleanContent.includes('{'))) {
+    try {
+      const jsonStr = cleanContent.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim()
+      const parsed = JSON.parse(jsonStr)
+      if (parsed && typeof parsed === 'object') {
+        const title = parsed.title || parsed.topic || 'Executive Report'
+        const keyMessage = parsed.keyMessage || parsed.impact || parsed.situation || ''
+        const findings = parsed.findings || parsed.facts || parsed.points || []
+        const recs = parsed.recommendations || []
+        cleanContent = `# ${title}\n\n${keyMessage ? `### Situation\n${keyMessage}\n\n` : ''}${findings.length ? `### Key Findings\n${findings.map((f: any) => typeof f === 'string' ? `- ${f}` : `- ${f.title || f.claim || ''}: ${f.reason || f.label || ''}`).join('\n')}\n\n` : ''}${recs.length ? `### Recommended Actions\n${recs.map((r: any) => `- ${r}`).join('\n')}` : ''}`
+      }
+    } catch (_) { }
+  }
+
+  // Remove stray markdown formatting (bold, tables) and normalize line breaks
+  const formatted = cleanContent
+    .replace(/\*\*/g, '')
+    .split('\n')
+    .map(line => {
+      if (line.includes('|')) {
+        const cells = line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+        if (cells.every(c => /^-+$/.test(c))) return null; // separator row
+        if (cells[0].toLowerCase().includes('metric') && cells[1]?.toLowerCase().includes('observation')) return null; // header row
+        if (cells.length >= 2) return `- ${cells[0]}: ${cells[1]}`;
+        return `- ${cells[0]}`;
+      }
+      return line;
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  const normalized = formatted
     .replace(/---/g, '\n\n')
     .replace(/[•·]\s*(?=\*\*Bullet\s*\d+:)/gi, '\n')
     .replace(/(Title:\s*)/gi, '\n$1')
     .replace(/(\*?Speaker Notes?:?\s*)/gi, '\n$1')
     .replace(/(#{1,3}\s*Slide\s+\d+)/gi, '\n$1')
-    .replace(/\s*[•·]\s*/g, '\n- ')
+    .replace(/\s*[•·]\s*/g, '\n- ');
 
   return (
     <div className="generated-text">
@@ -36,7 +77,7 @@ function StructuredContent({ content }: { content: string }) {
         if (/^#{1,3}\s/.test(line)) {
           const isSlide = /^#{1,3}\s*Slide\s+\d+/i.test(line)
           return (
-            <h2 className={isSlide ? 'generated-slide' : 'generated-section'} key={i}>
+            <h2 className={isSlide ? 'generated-slide-heading' : 'generated-section-heading'} key={i}>
               {line.replace(/^#{1,3}\s*/, '')}
             </h2>
           )
@@ -89,8 +130,8 @@ function StructuredContent({ content }: { content: string }) {
         if (fact)
           return (
             <div className="generated-fact" key={i}>
-              <b>{fact[1]}</b>
-              <span>{fact[2]}</span>
+              <b className="generated-fact-label">{fact[1]}</b>
+              <span className="generated-fact-value">{fact[2]}</span>
             </div>
           )
 
@@ -124,6 +165,9 @@ export default function Results({ project, setProject, onNew, onNotice }: Props)
   const [showAnalysis, setShowAnalysis] = useState(false)
   const [selectedHistoryIdx, setSelectedHistoryIdx] = useState<number | null>(null)
   const [isRegenerating, setIsRegenerating] = useState(false)
+
+  const posterRef = useRef<HTMLDivElement | null>(null)
+  const [infographicMode, setInfographicMode] = useState<'preview' | 'edit'>('preview')
 
   const [showSocialModal, setShowSocialModal] = useState(false)
   const [socialPlatform, setSocialPlatform] = useState<'linkedin' | 'twitter'>('linkedin')
@@ -233,8 +277,8 @@ export default function Results({ project, setProject, onNew, onNotice }: Props)
     currentVerification?.references && currentVerification.references.length > 0
       ? currentVerification.references
       : currentEvaluation?.references && currentEvaluation.references.length > 0
-      ? currentEvaluation.references
-      : project.retrieval.references || []
+        ? currentEvaluation.references
+        : project.retrieval.references || []
 
   const update = (value: string) => {
     if (currentKey) {
@@ -262,7 +306,7 @@ export default function Results({ project, setProject, onNew, onNotice }: Props)
             reviewStatus: 'approved',
           }),
         })
-      } catch (_) {}
+      } catch (_) { }
     }
     onNotice(`Approved ${labels[currentKey] || currentKey}! Binary export options unlocked for this format.`)
   }
@@ -415,391 +459,454 @@ export default function Results({ project, setProject, onNew, onNotice }: Props)
                 }}
                 className={i === safeTab ? 'active' : ''}
               >
+                <div>
+                  <b>{labels[id] || id}</b>
+                  <small>
+                    {project.evaluations?.[id]
+                      ? `${Math.round((project.evaluations[id].overallScore || 0.95) * 100)}% Quality`
+                      : 'Verified'}
+                  </small>
+                </div>
+                <i>›</i>
+              </button>
+            ))}
+          </nav>
+
+          <article className="panel result-content">
+            <header>
               <div>
-                <b>{labels[id] || id}</b>
-                <small>
-                  {project.evaluations?.[id]
-                    ? `${Math.round((project.evaluations[id].overallScore || 0.95) * 100)}% Quality`
-                    : 'Verified'}
-                </small>
+                <span>🏛️</span>
+                <b>
+                  {currentKey ? labels[currentKey] : 'Output'}
+                  <small className={isApproved ? 'status-approved' : isEdited ? 'status-edited' : 'status-ready'}>
+                    {isApproved
+                      ? '✓ Approved by Operator'
+                      : isEdited
+                        ? 'Edited by Operator'
+                        : 'Source Grounded · Ready for Human Review'}
+                  </small>
+                </b>
               </div>
-              <i>›</i>
-            </button>
-          ))}
-        </nav>
+              <div>
+                <button
+                  disabled={isRegenerating}
+                  onClick={() => {
+                    if (currentKey === 'infographic') {
+                      setInfographicMode(m => (m === 'preview' ? 'edit' : 'preview'))
+                    } else {
+                      if (editing) {
+                        setEditing(false)
+                        onNotice('Draft edits saved.')
+                      } else {
+                        setEditing(true)
+                      }
+                    }
+                  }}
+                >
+                  {currentKey === 'infographic'
+                    ? infographicMode === 'edit'
+                      ? '👁 View Preview'
+                      : '✏️ Edit Content'
+                    : editing
+                      ? 'Save Draft'
+                      : 'Edit Text'}
+                </button>
+              </div>
+            </header>
 
-        <article className="panel result-content">
-          <header>
-            <div>
-              <span>🏛️</span>
-              <b>
-                {currentKey ? labels[currentKey] : 'Output'}
-                <small className={isApproved ? 'status-approved' : isEdited ? 'status-edited' : 'status-ready'}>
-                  {isApproved
-                    ? '✓ Approved by Operator'
-                    : isEdited
-                    ? 'Edited by Operator'
-                    : 'Source Grounded · Ready for Human Review'}
-                </small>
-              </b>
-            </div>
-            <div>
-              <button
-                disabled={isRegenerating}
-                onClick={() => {
-                  if (editing) {
-                    setEditing(false)
-                    onNotice('Draft edits saved.')
-                  } else {
-                    setEditing(true)
-                  }
-                }}
-              >
-                {editing ? 'Save Draft' : 'Edit Text'}
-              </button>
-            </div>
-          </header>
-
-          <div className="result-body">
-            {/* Top Output Status Pills */}
-            <section className="quality-row">
-              <span className="pill green">✓ Source Grounded</span>
-              <span className="pill green">✓ Consistent</span>
-              <span className="pill green">✓ Format Validated</span>
-              <span className="pill indigo">Iterations: {iterationsCount}</span>
-              <span className={isApproved ? 'pill approved' : isEdited ? 'pill edited' : 'pill ready'}>
-                {isApproved ? '✓ Approved' : isEdited ? 'Edited by Operator' : 'Ready for Review'}
-              </span>
-            </section>
-
-            {/* Quality Summary Header Card */}
-            <section className="quality-summary-card">
-              <div className="quality-overall-box">
-                <small>OVERALL QUALITY</small>
-                <h2>{Math.round((currentEvaluation.overallScore || 0.95) * 100)}%</h2>
-                <span>
-                  {currentEvaluation.passed ? '✓ Passed Automated Gate' : '⚠ Needs Operator Review'}
+            <div className="result-body">
+              {/* Top Output Status Pills */}
+              <section className="quality-row">
+                <span className="pill green">✓ Source Grounded</span>
+                <span className="pill green">✓ Consistent</span>
+                <span className="pill green">✓ Format Validated</span>
+                <span className="pill indigo">Iterations: {iterationsCount}</span>
+                <span className={isApproved ? 'pill approved' : isEdited ? 'pill edited' : 'pill ready'}>
+                  {isApproved ? '✓ Approved' : isEdited ? 'Edited by Operator' : 'Ready for Review'}
                 </span>
-              </div>
-              <div className="quality-metrics-row">
-                <div className="metric-chip">
-                  <small>Grounding</small>
-                  <b>{Math.round((currentEvaluation.groundingScore || 0.96) * 100)}%</b>
-                </div>
-                <div className="metric-chip">
-                  <small>Consistency</small>
-                  <b>{Math.round((currentEvaluation.consistencyScore || 0.94) * 100)}%</b>
-                </div>
-                <div className="metric-chip">
-                  <small>Completeness</small>
-                  <b>{Math.round((currentEvaluation.completenessScore || 0.92) * 100)}%</b>
-                </div>
-                <div className="metric-chip">
-                  <small>Format</small>
-                  <b>{Math.round((currentEvaluation.formatScore || 1.0) * 100)}%</b>
-                </div>
-                <div className="metric-chip">
-                  <small>Audience</small>
-                  <b>{Math.round((currentEvaluation.audienceScore || 0.95) * 100)}%</b>
-                </div>
-              </div>
-              <button
-                className="view-analysis-btn"
-                onClick={() => setShowAnalysis(!showAnalysis)}
-              >
-                {showAnalysis ? '▲ Close Quality Analysis' : '▼ View Quality Analysis & Audit'}
-              </button>
-            </section>
+              </section>
 
-            {/* Expandable Quality Analysis Drawer */}
-            {showAnalysis && (
-              <section className="quality-analysis-drawer fade">
-                <div className="drawer-header">
-                  <h3>Automated Quality Analysis &amp; Diagnostic Audit</h3>
-                  <small>Detailed breakdown of how this output was verified across 5 dimensions.</small>
+              {/* Quality Summary Header Card */}
+              <section className="quality-summary-card">
+                <div className="quality-overall-box">
+                  <small>OVERALL QUALITY</small>
+                  <h2>{Math.round((currentEvaluation.overallScore || 0.95) * 100)}%</h2>
+                  <span>
+                    {currentEvaluation.passed ? '✓ Passed Automated Gate' : '⚠ Needs Operator Review'}
+                  </span>
                 </div>
-
-                <div className="analysis-grid">
-                  <div className="analysis-card">
-                    <div className="analysis-card-head">
-                      <span className="check-icon">✓</span>
-                      <b>Source Grounding</b>
-                      <mark>{Math.round((currentEvaluation.groundingScore || 0.96) * 100)}%</mark>
-                    </div>
-                    <p>
-                      Factual claims verified against retrieved semantic source chunks with zero hallucinations.
-                    </p>
+                <div className="quality-metrics-row">
+                  <div className="metric-chip">
+                    <small>Grounding</small>
+                    <b>{Math.round((currentEvaluation.groundingScore || 0.96) * 100)}%</b>
                   </div>
-
-                  <div className="analysis-card">
-                    <div className="analysis-card-head">
-                      <span className="check-icon">✓</span>
-                      <b>Fact Consistency</b>
-                      <mark>{Math.round((currentEvaluation.consistencyScore || 0.94) * 100)}%</mark>
-                    </div>
-                    <p>Numbers, entities, and risk ratings match the extracted source intelligence without contradiction.</p>
+                  <div className="metric-chip">
+                    <small>Consistency</small>
+                    <b>{Math.round((currentEvaluation.consistencyScore || 0.94) * 100)}%</b>
                   </div>
-
-                  <div className="analysis-card">
-                    <div className="analysis-card-head">
-                      <span className="check-icon">✓</span>
-                      <b>Completeness</b>
-                      <mark>{Math.round((currentEvaluation.completenessScore || 0.92) * 100)}%</mark>
-                    </div>
-                    <p>
-                      {currentEvaluation.missingInformation?.length > 0
-                        ? `Minor item omitted: ${currentEvaluation.missingInformation[0].field}`
-                        : 'All required sections and structural components are fully represented.'}
-                    </p>
+                  <div className="metric-chip">
+                    <small>Completeness</small>
+                    <b>{Math.round((currentEvaluation.completenessScore || 0.92) * 100)}%</b>
                   </div>
-
-                  <div className="analysis-card">
-                    <div className="analysis-card-head">
-                      <span className="check-icon">✓</span>
-                      <b>Format &amp; Structure</b>
-                      <mark>{Math.round((currentEvaluation.formatScore || 1.0) * 100)}%</mark>
-                    </div>
-                    <p>Markdown headings, list structures, character constraints, and slide formats verified.</p>
+                  <div className="metric-chip">
+                    <small>Format</small>
+                    <b>{Math.round((currentEvaluation.formatScore || 1.0) * 100)}%</b>
+                  </div>
+                  <div className="metric-chip">
+                    <small>Audience</small>
+                    <b>{Math.round((currentEvaluation.audienceScore || 0.95) * 100)}%</b>
                   </div>
                 </div>
+                <button
+                  className="view-analysis-btn"
+                  onClick={() => setShowAnalysis(!showAnalysis)}
+                >
+                  {showAnalysis ? '▲ Close Quality Analysis' : '▼ View Quality Analysis & Audit'}
+                </button>
+              </section>
 
-                {/* Unsupported Claims Management inside Dropdown Drawer */}
-                {currentEvaluation.unsupportedClaims && currentEvaluation.unsupportedClaims.length > 0 && (
-                  <section className="unsupported-claims-alert">
-                    <div className="alert-head">
-                      <span className="warning-icon">⚠</span>
-                      <div>
-                        <b>Unsupported Claims Detected ({currentEvaluation.unsupportedClaims.length})</b>
-                        <small>
-                          Statements identified by the auditor that require grounding or removal.
-                        </small>
+              {/* Expandable Quality Analysis Drawer */}
+              {showAnalysis && (
+                <section className="quality-analysis-drawer fade">
+                  <div className="drawer-header">
+                    <h3>Automated Quality Analysis &amp; Diagnostic Audit</h3>
+                    <small>Detailed breakdown of how this output was verified across 5 dimensions.</small>
+                  </div>
+
+                  <div className="analysis-grid">
+                    <div className="analysis-card">
+                      <div className="analysis-card-head">
+                        <span className="check-icon">✓</span>
+                        <b>Source Grounding</b>
+                        <mark>{Math.round((currentEvaluation.groundingScore || 0.96) * 100)}%</mark>
                       </div>
+                      <p>
+                        Factual claims verified against retrieved semantic source chunks with zero hallucinations.
+                      </p>
                     </div>
 
-                    <div className="unsupported-items-list">
-                      {currentEvaluation.unsupportedClaims.map((item, idx) => (
-                        <div className="unsupported-item" key={idx}>
-                          <div className="claim-box">
-                            <small>FLAGGED CLAIM:</small>
-                            <q>{item.claim}</q>
-                            <p>
-                              <b>Reason:</b> {item.reason}
-                            </p>
-                          </div>
-                          <div className="claim-actions">
-                            <button
-                              className="secondary small-btn"
-                              disabled={isRegenerating}
-                              onClick={() => handleManualRegenerate('', item.claim)}
-                            >
-                              Remove Claim
-                            </button>
-                            <button
-                              className="primary small-btn"
-                              disabled={isRegenerating}
-                              onClick={() =>
-                                handleManualRegenerate(
-                                  `Regenerate and replace the specific unverified claim: "${item.claim}" with source-grounded facts.`,
-                                  item.claim
-                                )
-                              }
-                            >
-                              Regenerate Claim
-                            </button>
-                          </div>
+                    <div className="analysis-card">
+                      <div className="analysis-card-head">
+                        <span className="check-icon">✓</span>
+                        <b>Fact Consistency</b>
+                        <mark>{Math.round((currentEvaluation.consistencyScore || 0.94) * 100)}%</mark>
+                      </div>
+                      <p>Numbers, entities, and risk ratings match the extracted source intelligence without contradiction.</p>
+                    </div>
+
+                    <div className="analysis-card">
+                      <div className="analysis-card-head">
+                        <span className="check-icon">✓</span>
+                        <b>Completeness</b>
+                        <mark>{Math.round((currentEvaluation.completenessScore || 0.92) * 100)}%</mark>
+                      </div>
+                      <p>
+                        {currentEvaluation.missingInformation?.length > 0
+                          ? `Minor item omitted: ${currentEvaluation.missingInformation[0].field}`
+                          : 'All required sections and structural components are fully represented.'}
+                      </p>
+                    </div>
+
+                    <div className="analysis-card">
+                      <div className="analysis-card-head">
+                        <span className="check-icon">✓</span>
+                        <b>Format &amp; Structure</b>
+                        <mark>{Math.round((currentEvaluation.formatScore || 1.0) * 100)}%</mark>
+                      </div>
+                      <p>Markdown headings, list structures, character constraints, and slide formats verified.</p>
+                    </div>
+                  </div>
+
+                  {/* Unsupported Claims Management inside Dropdown Drawer */}
+                  {currentEvaluation.unsupportedClaims && currentEvaluation.unsupportedClaims.length > 0 && (
+                    <section className="unsupported-claims-alert">
+                      <div className="alert-head">
+                        <span className="warning-icon">⚠</span>
+                        <div>
+                          <b>Unsupported Claims Detected ({currentEvaluation.unsupportedClaims.length})</b>
+                          <small>
+                            Statements identified by the auditor that require grounding or removal.
+                          </small>
                         </div>
-                      ))}
-                    </div>
-                  </section>
-                )}
+                      </div>
 
-                {/* Iteration History Comparison */}
-                {currentHistory.length > 0 && (
-                  <div className="iteration-history-box">
-                    <div className="iteration-history-head">
-                      <h4>AI Generation Iteration History ({currentHistory.length} Iterations)</h4>
-                      <div className="iteration-pills">
-                        {currentHistory.map((step, idx) => (
-                          <button
-                            key={idx}
-                            className={
-                              'iteration-pill ' +
-                              (selectedHistoryIdx === idx || (selectedHistoryIdx === null && idx === currentHistory.length - 1)
-                                ? 'active'
-                                : '')
-                            }
-                            onClick={() => setSelectedHistoryIdx(idx)}
-                          >
-                            Iteration {step.iteration} (
-                            {Math.round((step.evaluation?.overallScore || 0.86) * 100)}%)
-                          </button>
+                      <div className="unsupported-items-list">
+                        {currentEvaluation.unsupportedClaims.map((item, idx) => (
+                          <div className="unsupported-item" key={idx}>
+                            <div className="claim-box">
+                              <small>FLAGGED CLAIM:</small>
+                              <q>{item.claim}</q>
+                              <p>
+                                <b>Reason:</b> {item.reason}
+                              </p>
+                            </div>
+                            <div className="claim-actions">
+                              <button
+                                className="secondary small-btn"
+                                disabled={isRegenerating}
+                                onClick={() => handleManualRegenerate('', item.claim)}
+                              >
+                                Remove Claim
+                              </button>
+                              <button
+                                className="primary small-btn"
+                                disabled={isRegenerating}
+                                onClick={() =>
+                                  handleManualRegenerate(
+                                    `Regenerate and replace the specific unverified claim: "${item.claim}" with source-grounded facts.`,
+                                    item.claim
+                                  )
+                                }
+                              >
+                                Regenerate Claim
+                              </button>
+                            </div>
+                          </div>
                         ))}
                       </div>
-                    </div>
+                    </section>
+                  )}
 
-                    {(() => {
-                      const activeStep =
-                        selectedHistoryIdx !== null
-                          ? currentHistory[selectedHistoryIdx]
-                          : currentHistory[currentHistory.length - 1]
-                      if (!activeStep) return null
-
-                      return (
-                        <div className="iteration-snapshot">
-                          <div className="snapshot-meta">
-                            <span>
-                              <b>Iteration {activeStep.iteration}</b> · Overall Score:{' '}
-                              <b>{Math.round((activeStep.evaluation?.overallScore || 0.86) * 100)}%</b> · Grounding:{' '}
-                              <b>{Math.round((activeStep.evaluation?.groundingScore || 0.84) * 100)}%</b>
-                            </span>
-                            <mark className={activeStep.decision?.passed ? 'pass-mark' : 'warn-mark'}>
-                              {activeStep.decision?.passed ? '✓ Passed Quality Gate' : '⚠ Required Repair'}
-                            </mark>
-                          </div>
-                          {activeStep.feedback && (
-                            <div className="snapshot-feedback">
-                              <b>Applied Structured Feedback:</b>
-                              <p>{activeStep.feedback.instructions}</p>
-                            </div>
-                          )}
+                  {/* Iteration History Comparison */}
+                  {currentHistory.length > 0 && (
+                    <div className="iteration-history-box">
+                      <div className="iteration-history-head">
+                        <h4>AI Generation Iteration History ({currentHistory.length} Iterations)</h4>
+                        <div className="iteration-pills">
+                          {currentHistory.map((step, idx) => (
+                            <button
+                              key={idx}
+                              className={
+                                'iteration-pill ' +
+                                (selectedHistoryIdx === idx || (selectedHistoryIdx === null && idx === currentHistory.length - 1)
+                                  ? 'active'
+                                  : '')
+                              }
+                              onClick={() => setSelectedHistoryIdx(idx)}
+                            >
+                              Iteration {step.iteration} (
+                              {Math.round((step.evaluation?.overallScore || 0.86) * 100)}%)
+                            </button>
+                          ))}
                         </div>
-                      )
-                    })()}
-                  </div>
-                )}
-              </section>
-            )}
+                      </div>
 
-            {/* Draft Content Rendering or Editor */}
-            {editing ? (
-              <div className="editor-wrap">
-                <textarea
-                  className="output-editor"
-                  value={content}
-                  onChange={e => update(e.target.value)}
-                  rows={18}
-                  placeholder="Edit generated Markdown content..."
-                />
-                <div className="editor-footer">
-                  <small>Editing directly changes content and tags status as "Edited by Operator".</small>
+                      {(() => {
+                        const activeStep =
+                          selectedHistoryIdx !== null
+                            ? currentHistory[selectedHistoryIdx]
+                            : currentHistory[currentHistory.length - 1]
+                        if (!activeStep) return null
+
+                        return (
+                          <div className="iteration-snapshot">
+                            <div className="snapshot-meta">
+                              <span>
+                                <b>Iteration {activeStep.iteration}</b> · Overall Score:{' '}
+                                <b>{Math.round((activeStep.evaluation?.overallScore || 0.86) * 100)}%</b> · Grounding:{' '}
+                                <b>{Math.round((activeStep.evaluation?.groundingScore || 0.84) * 100)}%</b>
+                              </span>
+                              <mark className={activeStep.decision?.passed ? 'pass-mark' : 'warn-mark'}>
+                                {activeStep.decision?.passed ? '✓ Passed Quality Gate' : '⚠ Required Repair'}
+                              </mark>
+                            </div>
+                            {activeStep.feedback && (
+                              <div className="snapshot-feedback">
+                                <b>Applied Structured Feedback:</b>
+                                <p>{activeStep.feedback.instructions}</p>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {/* Draft Content Rendering or Editor */}
+              {currentKey === 'infographic' ? (
+                <div className="infographic-wrapper">
+                  <InfographicExport
+                    targetRef={posterRef}
+                    mode={infographicMode}
+                    setMode={setInfographicMode}
+                    onNotice={onNotice}
+                  />
+                  {editing || infographicMode === 'edit' ? (
+                    <div className="split-editor-layout">
+                      <InfographicEditor
+                        data={parseInfographicData(content)}
+                        onChange={updated => update(JSON.stringify(updated, null, 2))}
+                      />
+                      <InfographicPreview
+                        ref={posterRef}
+                        data={parseInfographicData(content)}
+                      />
+                    </div>
+                  ) : (
+                    <InfographicPreview
+                      ref={posterRef}
+                      data={parseInfographicData(content)}
+                    />
+                  )}
+                </div>
+              ) : editing ? (
+                <div className="editor-wrap">
+                  <textarea
+                    className="output-editor"
+                    value={content}
+                    onChange={e => update(e.target.value)}
+                    rows={18}
+                    placeholder="Edit generated Markdown content..."
+                  />
+                  <div className="editor-footer">
+                    <small>Editing directly changes content and tags status as "Edited by Operator".</small>
+                    <button
+                      className="primary"
+                      onClick={() => {
+                        setEditing(false)
+                        onNotice('Changes saved to draft.')
+                      }}
+                    >
+                      Save Changes
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <StructuredContent content={content} />
+              )}
+
+              {/* Source Grounding & Source References */}
+              <section className="result-panel grounding">
+                <h3>
+                  Source Grounding <mark>✓ Verified</mark>
+                </h3>
+                <p>
+                  <b>
+                    {Math.round((currentEvaluation.groundingScore || 0.96) * 100)}% claims verified
+                  </b>{' '}
+                  against source text sections.
+                </p>
+                <h4>Real Source References</h4>
+                <div className="reference-list">
+                  {currentReferences.length > 0 ? (
+                    currentReferences.map(ref => (
+                      <button key={ref.id} onClick={() => setSelectedRef(ref)}>
+                        {ref.title} <i>↗</i>
+                      </button>
+                    ))
+                  ) : (
+                    <p style={{ color: '#64748b', fontSize: '12px' }}>Original uploaded source text sections</p>
+                  )}
+                </div>
+              </section>
+
+              {/* Human Review & Operator Decision */}
+              <section className="review-panel">
+                <div>
+                  <p className="eyebrow">HUMAN REVIEW &amp; APPROVAL</p>
+                  <h3>
+                    {isApproved
+                      ? '✓ Content Approved by Operator'
+                      : isEdited
+                        ? 'Edited by Operator · Ready to Approve'
+                        : 'AI Quality Loop Passed · Ready for Human Review'}
+                  </h3>
+                  <span>
+                    {isApproved
+                      ? 'This output is approved. Select a file format below to download.'
+                      : isEdited
+                        ? 'Manual operator modifications saved. Approve to unlock binary exports.'
+                        : 'Review and approve this source-grounded draft to unlock binary file downloads.'}
+                  </span>
+                </div>
+                <div className="review-actions">
+                  <button
+                    className="secondary"
+                    disabled={isRegenerating}
+                    onClick={() => handleManualRegenerate()}
+                    title={`Regenerate ${labels[currentKey] || 'this format'} only`}
+                  >
+                    ↺ Regenerate {labels[currentKey] || 'Format'} Only
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => setEditing(!editing)}
+                  >
+                    {editing ? 'Done Editing' : 'Edit'}
+                  </button>
                   <button
                     className="primary"
-                    onClick={() => {
-                      setEditing(false)
-                      onNotice('Changes saved to draft.')
-                    }}
+                    disabled={isApproved || isRegenerating}
+                    onClick={handleApprove}
                   >
-                    Save Changes
+                    {isApproved ? '✓ Approved' : 'Approve'}
                   </button>
                 </div>
-              </div>
-            ) : (
-              <StructuredContent content={content} />
-            )}
+              </section>
 
-            {/* Source Grounding & Source References */}
-            <section className="result-panel grounding">
-              <h3>
-                Source Grounding <mark>✓ Verified</mark>
-              </h3>
-              <p>
-                <b>
-                  {Math.round((currentEvaluation.groundingScore || 0.96) * 100)}% claims verified
-                </b>{' '}
-                against source text sections.
-              </p>
-              <h4>Real Source References</h4>
-              <div className="reference-list">
-                {currentReferences.length > 0 ? (
-                  currentReferences.map(ref => (
-                    <button key={ref.id} onClick={() => setSelectedRef(ref)}>
-                      {ref.title} <i>↗</i>
-                    </button>
-                  ))
-                ) : (
-                  <p style={{ color: '#64748b', fontSize: '12px' }}>Original uploaded source text sections</p>
-                )}
-              </div>
-            </section>
+              {/* Binary Document Downloads & Direct Social Media Publishing */}
+              {isApproved && (
+                <>
+                  <section className="export-actions fade">
+                    <b>Download File:</b>
+                    {currentKey === 'infographic' && (
+                      <button
+                        className="primary-export"
+                        style={{ background: '#4f46e5', borderColor: '#6366f1', color: '#fff' }}
+                        onClick={async () => {
+                          if (posterRef.current) {
+                            try {
+                              onNotice('Preparing high-res PNG image download...')
+                              const dataUrl = await toPng(posterRef.current, { quality: 0.95, pixelRatio: 2 })
+                              const a = document.createElement('a')
+                              a.download = `transformai_infographic_${Date.now()}.png`
+                              a.href = dataUrl
+                              document.body.appendChild(a)
+                              a.click()
+                              document.body.removeChild(a)
+                              onNotice('✓ Infographic exported as PNG image!')
+                            } catch (err) {
+                              onNotice('Failed to export PNG image.')
+                            }
+                          } else {
+                            onNotice('Infographic poster preview not found.')
+                          }
+                        }}
+                      >
+                        🖼️ Infographic Image (.png)
+                      </button>
+                    )}
+                    <button onClick={() => handleExport('pdf')}>📄 PDF Document</button>
+                    <button onClick={() => handleExport('docx')}>📝 Word (.docx)</button>
+                    <button onClick={() => handleExport('pptx')}>📊 PowerPoint (.pptx)</button>
+                  </section>
 
-            {/* Human Review & Operator Decision */}
-            <section className="review-panel">
-              <div>
-                <p className="eyebrow">HUMAN REVIEW &amp; APPROVAL</p>
-                <h3>
-                  {isApproved
-                    ? '✓ Content Approved by Operator'
-                    : isEdited
-                    ? 'Edited by Operator · Ready to Approve'
-                    : 'AI Quality Loop Passed · Ready for Human Review'}
-                </h3>
-                <span>
-                  {isApproved
-                    ? 'This output is approved. Select a file format below to download.'
-                    : isEdited
-                    ? 'Manual operator modifications saved. Approve to unlock binary exports.'
-                    : 'Review and approve this source-grounded draft to unlock binary file downloads.'}
-                </span>
-              </div>
-              <div className="review-actions">
-                <button
-                  className="secondary"
-                  disabled={isRegenerating}
-                  onClick={() => handleManualRegenerate()}
-                  title={`Regenerate ${labels[currentKey] || 'this format'} only`}
-                >
-                  ↺ Regenerate {labels[currentKey] || 'Format'} Only
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => setEditing(!editing)}
-                >
-                  {editing ? 'Done Editing' : 'Edit'}
-                </button>
-                <button
-                  className="primary"
-                  disabled={isApproved || isRegenerating}
-                  onClick={handleApprove}
-                >
-                  {isApproved ? '✓ Approved' : 'Approve'}
-                </button>
-              </div>
-            </section>
-
-            {/* Binary Document Downloads & Direct Social Media Publishing */}
-            {isApproved && (
-              <>
-                <section className="export-actions fade">
-                  <b>Download File:</b>
-                  <button onClick={() => handleExport('pdf')}>📄 PDF Document</button>
-                  <button onClick={() => handleExport('docx')}>📝 Word (.docx)</button>
-                  <button onClick={() => handleExport('pptx')}>📊 PowerPoint (.pptx)</button>
-                </section>
-
-                <section className="social-publish-actions fade">
-                  <div className="social-publish-head">
-                    <span className="social-badge">🚀 DIRECT PUBLISHING</span>
-                    <b>Share Approved Content to Social Networks:</b>
-                  </div>
-                  <div className="social-publish-buttons">
-                    <button className="social-btn linkedin-btn" onClick={() => handleWebShare('linkedin')}>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.46 10.9v8.37H9.25V10.9H6.46M7.86 6.63a1.4 1.4 0 1 0 0 2.8 1.4 1.4 0 0 0 0-2.8z"/></svg>
-                      Post to LinkedIn (1-Click)
-                    </button>
-                    <button className="social-btn twitter-btn" onClick={() => handleWebShare('twitter')}>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
-                      Tweet on X (1-Click)
-                    </button>
-                    <button className="social-btn api-btn" onClick={() => openSocialModal('linkedin')}>
-                      ⚡ Social API Direct Publisher
-                    </button>
-                  </div>
-                </section>
-              </>
-            )}
-          </div>
-        </article>
-      </div>
+                  <section className="social-publish-actions fade">
+                    <div className="social-publish-head">
+                      <span className="social-badge">🚀 DIRECT PUBLISHING</span>
+                      <b>Share Approved Content to Social Networks:</b>
+                    </div>
+                    <div className="social-publish-buttons">
+                      <button className="social-btn linkedin-btn" onClick={() => handleWebShare('linkedin')}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.46 10.9v8.37H9.25V10.9H6.46M7.86 6.63a1.4 1.4 0 1 0 0 2.8 1.4 1.4 0 0 0 0-2.8z" /></svg>
+                        Post to LinkedIn (1-Click)
+                      </button>
+                      <button className="social-btn twitter-btn" onClick={() => handleWebShare('twitter')}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" /></svg>
+                        Tweet on X (1-Click)
+                      </button>
+                      <button className="social-btn api-btn" onClick={() => openSocialModal('linkedin')}>
+                        ⚡ Social API Direct Publisher
+                      </button>
+                    </div>
+                  </section>
+                </>
+              )}
+            </div>
+          </article>
+        </div>
       )}
 
       {/* Direct Social Media Publishing Modal */}
