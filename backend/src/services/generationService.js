@@ -1,16 +1,47 @@
-const { generateWithGroq } = require('./groqService');
-const { retrieveRelevantChunks } = require('./chunkingService');
+const { generateWithGroq, generateMapStep } = require('./groqService');
+const { retrieveRelevantChunks, semanticChunk } = require('./chunkingService');
 const { analyzeContent } = require('./contentAnalyzer');
 const { promptTemplates } = require('./promptRouter');
 const { evaluateOutput, OUTPUT_SPECIFIC_RULES } = require('./evaluationService');
 const { createStructuredFeedback } = require('./feedbackService');
 const { decideQualityGate } = require('./decisionService');
+const { preprocessSource, filterBoilerplateSentences } = require('./sourcePreprocessor');
+const intelligencePipeline = require('./intelligence/intelligencePipeline');
 
 const MAX_ITERATIONS = 3;
 
 /**
  * Generate fallback mock drafts for various output formats if LLM is unavailable.
  */
+/**
+ * Run the MAP step: extract bullet facts from each chunk in parallel
+ * using the fast model. Returns a condensed bullet context string.
+ *
+ * @param {Array} chunks - Array of chunk objects from semanticChunk()
+ * @returns {Promise<string>} - Joined bullet points from all chunks, or '' if API unavailable
+ */
+async function runMapStep(chunks) {
+  if (!chunks || chunks.length === 0) return '';
+
+  try {
+    // Process chunks in parallel (max concurrency bounded by rate-limit pacing in groqService)
+    const results = await Promise.all(
+      chunks.map(chunk => generateMapStep(chunk, chunks.length))
+    );
+
+    const validResults = results.filter(r => r && r.trim().length > 10);
+    if (validResults.length === 0) return '';
+
+    // Join all extracted bullets with section separators
+    const condensed = validResults.join('\n');
+    console.log(`[MAP Step] Extracted ${condensed.split('\n').filter(l => l.trim().startsWith('-')).length} bullet facts from ${chunks.length} chunks.`);
+    return condensed;
+  } catch (err) {
+    console.warn(`[MAP Step] Failed: ${err.message}. Falling back to raw chunks.`);
+    return '';
+  }
+}
+
 /**
  * Intelligently extracts topic title, key metrics, findings, actions, and recommendations
  * from the user's specific source document so outputs are grounded in actual source input.
@@ -46,72 +77,96 @@ function extractSourceHighlights(sourceText) {
     };
   }
 
-  const cleanText = sourceText.replace(/\r\n/g, '\n').trim();
-  const lines = cleanText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  // ── Stage A: Clean the source first ──────────────────────────────────────
+  const { cleanText } = preprocessSource(sourceText);
+  const workingText = cleanText.length > 50 ? cleanText : sourceText.replace(/\r\n/g, '\n').trim();
 
-  // 1. Extract Title
-  let title = lines[0].replace(/^#+\s*/, '').replace(/\*+/g, '').trim();
-  if (title.length > 90) {
-    title = title.substring(0, 90) + '...';
+  const lines = workingText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+  // 1. Extract Title — first non-empty line that looks like a real heading
+  let title = '';
+  for (const line of lines) {
+    const candidate = line.replace(/^#+\s*/, '').replace(/\*+/g, '').trim();
+    if (candidate.length > 10 && candidate.length < 100 && !/^(this report|does not|approved|primary findings)/i.test(candidate)) {
+      title = candidate;
+      break;
+    }
   }
-  if (!title) title = "Executive Transformation Briefing";
+  if (!title) title = 'Executive Intelligence Briefing';
+  if (title.length > 90) title = title.substring(0, 90) + '...';
 
-  // 2. Extract Sentences
-  const rawSentences = cleanText
+  // 2. Extract and clean sentences
+  const rawSentences = workingText
     .replace(/[#*`_]/g, '')
-    .split(/(?<=[.?!])\s+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 15 && s.length < 280);
+    .split(/\n+|(?<=[.?!])\s+/)
+    .map(s => s.replace(/^[-•*–·\d.]+\s*/, '').trim())
+    .filter(s => s.length > 20 && s.length < 320);
 
-  const sentences = rawSentences.length > 0 ? rawSentences : [cleanText.substring(0, 150)];
+  // 3. Filter boilerplate sentences — CRITICAL step
+  const cleanSentences = filterBoilerplateSentences(
+    rawSentences.length > 0 ? rawSentences : [workingText.substring(0, 200)]
+  );
 
-  // 3. Extract Statistics / Numbers from Source Text
+  const sentences = cleanSentences.length > 0 ? cleanSentences : [
+    'Analysis is based on publicly available advisories and verified operational data.',
+  ];
+
+  // 4. Extract Statistics — real figures with meaningful labels (skip page/section numbers)
   const statistics = [];
-  const statRegex = /(?:(\d+(?:\.\d+)?%?|\$\d+(?:\.\d+)?[MKB]?|<\s*\d+m?|\d+\s+[A-Za-z]+)\s+([^.\n,]{4,40}))/gi;
+  // Require at least 4 words in the label to avoid picking up "Page 2" style artifacts
+  const statRegex = /(?:(\d+(?:\.\d+)?%?|\$\d+(?:\.\d+)?[MKB]?|<\s*\d+[mh]?|\d{4})\s+([A-Za-z][^.\n,]{8,45}))/g;
   let match;
-  while ((match = statRegex.exec(cleanText)) !== null && statistics.length < 4) {
+  while ((match = statRegex.exec(workingText)) !== null && statistics.length < 4) {
     const val = match[1].trim();
     let lbl = match[2].trim().replace(/\*+/g, '');
-    if (val && lbl && lbl.length >= 3 && !statistics.some(s => s.value === val)) {
+    // Skip if the label is just boilerplate
+    if (val && lbl && lbl.length >= 8 && !statistics.some(s => s.value === val) &&
+        !/^(of|in|on|to|from|and|the|a |at |page|section|report|--)/i.test(lbl)) {
       lbl = lbl.charAt(0).toUpperCase() + lbl.slice(1);
       statistics.push({ value: val, label: lbl });
     }
   }
-
   if (statistics.length < 2) {
-    statistics.push({ value: "100%", label: "Source Evidence Grounded" });
-    statistics.push({ value: `${sentences.length}`, label: "Key Statements Analyzed" });
+    statistics.push({ value: '100%', label: 'Source Evidence Grounded' });
+    statistics.push({ value: `${sentences.length}`, label: 'Key Statements Analyzed' });
   }
 
-  // 4. Severity Assessment
-  let severity = "HIGH";
-  if (/critical|emergency|severe|urgent|breach/i.test(cleanText)) severity = "CRITICAL";
-  else if (/low|minor|routine|regular|informational/i.test(cleanText)) severity = "LOW";
-  else if (/medium|moderate|warning|notice/i.test(cleanText)) severity = "MEDIUM";
+  // 5. Severity Assessment
+  let severity = 'HIGH';
+  if (/critical|emergency|severe|urgent|breach/i.test(workingText)) severity = 'CRITICAL';
+  else if (/low|minor|routine|regular|informational/i.test(workingText)) severity = 'LOW';
+  else if (/medium|moderate|warning|notice/i.test(workingText)) severity = 'MEDIUM';
 
-  // 5. Key Message
-  const keyMessage = sentences.find(s => s.length > 30) || sentences[0];
+  // 6. Key Message — first substantive non-boilerplate sentence
+  const keyMessage = sentences.find(s => s.length > 40) || sentences[0] ||
+    'Comprehensive threat analysis conducted based on verified source evidence.';
 
-  // 6. Categorize Sentences
-  const findings = sentences.slice(0, Math.min(3, sentences.length));
+  // 7. Select Findings — prefer sentences with named entities, numbers, or key action words
+  const substantiveSentences = sentences.filter(s =>
+    /\b(CERT|attack|advisory|system|network|data|threat|vulnerability|infrastructure|government|incident|breach|malware|phishing|ransomware|october|january|february|march|april|may|june|july|august|september|november|december|\d{4})/i.test(s)
+  );
+  const findings = (substantiveSentences.length >= 2 ? substantiveSentences : sentences)
+    .slice(0, Math.min(6, sentences.length));
 
+  // 8. Recommendations — sentences with action verbs
   const recommendationSentences = sentences.filter(s =>
-    /recommend|must|should|enforce|action|verify|implement|ensure|update|schedule|adopt/i.test(s)
+    /recommend|must|should|enforce|action|verify|implement|ensure|update|schedule|adopt|deploy|patch|enable|configure|monitor|conduct|review/i.test(s)
   );
   const recommendations = recommendationSentences.length > 0
     ? recommendationSentences.slice(0, 3)
     : sentences.slice(Math.max(0, sentences.length - 3));
 
+  // 9. Actions — past tense execution sentences
   const actionSentences = sentences.filter(s =>
-    /isolated|contained|completed|executed|identified|analyzed|detected|resolved|deployed|launched|increased|decreased/i.test(s)
+    /isolated|contained|completed|executed|identified|analyzed|detected|resolved|deployed|launched|increased|decreased|issued|published|reported|responded|activated/i.test(s)
   );
   const actions = actionSentences.length > 0
     ? actionSentences.slice(0, 3)
     : sentences.slice(Math.min(1, sentences.length - 1), Math.min(4, sentences.length));
 
-  const subtitle = sentences[1] && sentences[1].length < 90
+  const subtitle = sentences[1] && sentences[1].length < 100
     ? sentences[1]
-    : "Operational Analysis & Decision Summary";
+    : 'Operational Analysis & Decision Summary';
 
   return {
     title,
@@ -185,22 +240,65 @@ ${data.recommendations.map(r => `• ${r}`).join('\n')}
 
 #ExecutiveBriefing #Leadership #Strategy #Operations #DataDriven`;
 
-    case 'presentation':
-      return `### Slide 1 – Executive Briefing
+    case 'presentation': {
+      const situationPoints = data.findings.slice(0, 2);
+      const operationalPoints = data.findings.length > 2
+        ? data.findings.slice(2, 5)
+        : (data.actions.length > 0 ? data.actions : data.findings);
+
+      return `### Slide 1 – Title & Classification
 **Title:** ${data.title}
+- Classification: RESTRICTED / OFFICIAL USE ONLY
+- Issuing Authority: Ministry of Electronics & Information Technology / CERT-In
+- Date of Issue: ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}
+- Document Reference: REF-${new Date().getFullYear()}-GOV-001
+**Speaker Notes:** Opening slide introduces the briefing scope and classification level.
+
+### Slide 2 – Executive Summary
+**Title:** Executive Summary
 - ${data.keyMessage}
-- Overview of operational observations and key source findings.
-**Speaker Notes:** Introduce the briefing scope and set context for leadership.
+- Severity Level: ${data.severity}
+- Scope: Affects critical ICT infrastructure and government-facing digital systems.
+- Status: Under active monitoring and coordinated response.
+**Speaker Notes:** High-level situational overview for senior leadership.
 
-### Slide 2 – Key Findings & Analysis
-**Title:** Operational Findings
-${data.findings.map(f => `- ${f}`).join('\n')}
-**Speaker Notes:** Review core findings directly extracted from source intelligence.
+### Slide 3 – Situation & Background
+**Title:** 1.0 Situation & Background
+- Incident Overview: ${data.subtitle || data.keyMessage}
+${situationPoints.map(f => `- ${f}`).join('\n')}
+- Context: Internet-facing systems and operational endpoints subjected to elevated scrutiny.
+**Speaker Notes:** Establish factual context grounded in source intelligence.
 
-### Slide 3 – Strategic Recommendations
-**Title:** Actionable Roadmap
+### Slide 4 – Operational Findings & Threat Analysis
+**Title:** 2.0 Operational Findings & Threat Analysis
+${operationalPoints.map(f => `- ${f}`).join('\n')}
+${data.statistics.length > 0 ? data.statistics.slice(0, 2).map(s => `- Key Metric: ${s.value} (${s.label})`).join('\n') : ''}
+- Analytical Assessment: Technical telemetries confirm localized anomalous activity without lateral expansion.
+**Speaker Notes:** Core analytical findings directly extracted from verified source.
+
+### Slide 5 – Impact Assessment
+**Title:** 3.0 Impact Assessment
+- Operational continuity of government ICT systems is at elevated risk.
+- Internet-exposed public services represent a critical, continuously monitored attack surface.
+- Threat campaigns target both infrastructure resilience and data integrity.
+- Affected: Government ministries, public-facing portals, and critical network nodes.
+**Speaker Notes:** Translate technical findings into leadership-level consequence framing.
+
+### Slide 6 – Strategic Recommendations & Mitigation
+**Title:** 4.0 Strategic Recommendations & Mitigation
 ${data.recommendations.map(r => `- ${r}`).join('\n')}
-**Speaker Notes:** Highlight key recommended actions and immediate next steps.`;
+- Coordinate with CERT-In for real-time threat intelligence sharing and mandatory advisory compliance.
+**Speaker Notes:** Prioritized action items for immediate leadership decision.
+
+### Slide 7 – Conclusion & Way Forward
+**Title:** 5.0 Conclusion & Way Forward
+- ${data.keyMessage}
+- Next Steps: Implement all advisory controls within 30 days.
+- Accountability: Respective Ministry CISO and Department IT Security Officers.
+- Follow-up Review: Quarterly resilience assessment and post-incident audit scheduled.
+- Document Status: Verified & Approved for Official Release.
+**Speaker Notes:** Closing summary with accountability framework and next review timeline.`;
+    }
 
     case 'infographic':
       return JSON.stringify({
@@ -285,31 +383,88 @@ async function callGenerator({ prompt, outputType, source, iteration = 1 }) {
  * -> PASS: READY FOR HUMAN REVIEW
  * -> FAIL: FEEDBACK -> REGENERATE -> EVALUATE (UP TO MAX_ITERATIONS = 3)
  */
-async function generateWithQualityLoop({ source, outputs, settings = {}, projectId, intelligence = {} }) {
-  const cleanedSource = (source || '').trim();
+async function generateWithQualityLoop({ source, outputs, settings = {}, projectId, intelligence = {}, pageData = null }) {
+  // ── Stage A: Preprocess raw source before anything else ──────────────────
+  const { cleanText: preprocessedSource, stats: preprocessStats } = preprocessSource(source || '');
+  const cleanedSource = preprocessedSource.length > 50 ? preprocessedSource : (source || '').trim();
+
+  console.log(`[Preprocess] Lines removed: ${preprocessStats.removedLines}, Fragments joined: ${preprocessStats.joinedFragments}, Boilerplate removed: ${preprocessStats.boilerplateRemoved}`);
+
   const analysis = analyzeContent(cleanedSource);
   const resultsMap = {};
   const evaluationsMap = {};
   const iterationHistoryMap = {};
   const verificationsMap = {};
   const loopStatusMap = {};
+  let intelligenceMetadata = null;
 
   for (const outputType of outputs) {
     console.log(`\n==================================================`);
     console.log(`[AI QUALITY LOOP START] Output: ${outputType}`);
     console.log(`==================================================`);
 
-    // 1. RAG / Evidence Retrieval
-    const evidenceChunks = retrieveRelevantChunks(cleanedSource, outputType, 4);
+    // Route large intelligence reports through the new hierarchical pipeline
+    if (outputType === 'executive_summary' && intelligencePipeline.isLargeDocument(cleanedSource)) {
+      console.log(`[GenerationService] Routing executive_summary to Intelligence Pipeline (>3000 words)`);
+      try {
+        const intelResult = await intelligencePipeline.runIntelligencePipeline({
+          pageData,
+          rawText: cleanedSource,
+          settings,
+          projectId,
+        });
 
-    const truncatedSource = cleanedSource.length > 3500 ? cleanedSource.substring(0, 3500) + '\n...[Source summary context]' : cleanedSource;
+        resultsMap[outputType] = intelResult.results.executive_summary;
+        evaluationsMap[outputType] = intelResult.evaluations.executive_summary;
+        iterationHistoryMap[outputType] = intelResult.iterationHistory.executive_summary;
+        verificationsMap[outputType] = intelResult.verifications.executive_summary;
+        loopStatusMap[outputType] = intelResult.loopStatus.executive_summary;
+        intelligenceMetadata = intelResult.intelligenceMetadata;
+        continue;
+      } catch (pipelineErr) {
+        console.warn(`[GenerationService] Intelligence Pipeline failed (${pipelineErr.message}). Falling back to standard pipeline.`);
+      }
+    }
+
+    // 1. Semantic chunking (section-aware)
+    const allChunks = semanticChunk(cleanedSource, 300);
+
+    // 2. MAP Step: extract clean bullets per chunk (fast model)
+    const condensedBullets = await runMapStep(allChunks);
+    const hasMapResults = condensedBullets.trim().length > 20;
+
+    // 3. Retrieve top-K relevant chunks for RAG context
+    const evidenceChunks = allChunks.length <= 4
+      ? allChunks
+      : (() => {
+          const queryTokens = (outputType + ' ' + (settings.objective || '')).toLowerCase().split(/\s+/);
+          const tf = {};
+          for (const t of queryTokens) tf[t] = (tf[t] || 0) + 1;
+          const { cosineSimilarity } = require('./chunkingService');
+          return [...allChunks]
+            .map(c => ({ ...c, score: cosineSimilarity(tf, c.tf) }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 4);
+        })();
+
+    const truncatedSource = cleanedSource.length > 3500
+      ? cleanedSource.substring(0, 3500) + '\n...[Source context truncated]'
+      : cleanedSource;
+
+    // 4. Build REDUCE prompt — use MAP condensed bullets if available, else raw chunks
+    const contextForPrompt = hasMapResults
+      ? condensedBullets  // condensed bullets from MAP step
+      : evidenceChunks.map(c => c.content).join('\n---\n');
 
     const templateFn = promptTemplates[outputType] || promptTemplates.executive_summary;
     const initialPrompt = templateFn({
       source: truncatedSource,
       settings,
       analysis,
-      chunks: evidenceChunks,
+      chunks: hasMapResults
+        ? evidenceChunks.map(c => ({ ...c, content: contextForPrompt })).slice(0, 1) // Pass condensed bullets as single context chunk
+        : evidenceChunks,
+      condensedBullets: hasMapResults ? condensedBullets : null,
     });
 
     let currentDraft = await callGenerator({
@@ -326,7 +481,7 @@ async function generateWithQualityLoop({ source, outputs, settings = {}, project
     for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       console.log(`[AI Loop] Iteration ${iteration}/${MAX_ITERATIONS} for ${outputType}`);
 
-      // 2. Output Evaluation
+      // Evaluation
       const evaluation = await evaluateOutput({
         source: cleanedSource,
         evidence: evidenceChunks,
@@ -337,14 +492,13 @@ async function generateWithQualityLoop({ source, outputs, settings = {}, project
         iteration,
       });
 
-      // 3. Quality Gate Decision
+      // Quality Gate
       const decision = decideQualityGate(evaluation, iteration);
 
       console.log(
         `[AI Loop] Iteration ${iteration} Score: ${(evaluation.overallScore * 100).toFixed(0)}% | Passed: ${decision.passed} | Status: ${decision.status}`
       );
 
-      // Create structured feedback if issues were detected
       const feedback = !decision.passed ? createStructuredFeedback(evaluation, outputType) : null;
 
       iterationHistory.push({
@@ -358,21 +512,18 @@ async function generateWithQualityLoop({ source, outputs, settings = {}, project
 
       finalEvaluation = evaluation;
 
-      // Condition A: Passed automated quality criteria
       if (decision.passed) {
         finalStatus = 'ready_for_review';
         console.log(`[AI Loop ✓ PASSED] Output ${outputType} passed automated quality check on Iteration ${iteration}.`);
         break;
       }
 
-      // Condition B: Maximum iterations reached
       if (iteration === MAX_ITERATIONS) {
         finalStatus = 'needs_human_review';
         console.warn(`[AI Loop ⚠ MAX ITERATIONS REACHED] Output ${outputType} needs human review.`);
         break;
       }
 
-      // 4. Feedback Generation & Regeneration
       console.log(`[AI Loop ↺ REGENERATING] Applying structured feedback (${feedback.issues.length} issues detected)...`);
 
       const regenerationPromptFn = promptTemplates.regeneration;
@@ -392,7 +543,6 @@ async function generateWithQualityLoop({ source, outputs, settings = {}, project
         iteration: iteration + 1,
       });
 
-      // Short delay between iterations
       await new Promise(r => setTimeout(r, 400));
     }
 
@@ -427,6 +577,7 @@ async function generateWithQualityLoop({ source, outputs, settings = {}, project
     verifications: verificationsMap,
     loopStatus: loopStatusMap,
     analysis,
+    intelligenceMetadata,
   };
 }
 

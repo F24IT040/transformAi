@@ -62,10 +62,19 @@ function initSchema() {
       created_at TEXT NOT NULL,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS chunk_cache (
+      content_hash TEXT PRIMARY KEY,
+      result_json TEXT NOT NULL,
+      model TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
   `);
 
   // Safe migrations for newly added columns if table already exists
   const columnsToAdd = [
+    'ALTER TABLE projects ADD COLUMN page_data_json TEXT',
     'ALTER TABLE generated_outputs ADD COLUMN overall_score REAL DEFAULT 1.0',
     'ALTER TABLE generated_outputs ADD COLUMN grounding_score REAL DEFAULT 1.0',
     'ALTER TABLE generated_outputs ADD COLUMN consistency_score REAL DEFAULT 1.0',
@@ -91,17 +100,19 @@ initSchema();
 
 // Repository methods
 const projectRepo = {
-  saveProject({ id, name, sourceType, extractedText }) {
+  saveProject({ id, name, sourceType, extractedText, pageData = null }) {
     const now = new Date().toISOString();
+    const pageDataJson = pageData ? JSON.stringify(pageData) : null;
     const stmt = db.prepare(`
-      INSERT INTO projects (id, name, source_type, extracted_text, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO projects (id, name, source_type, extracted_text, page_data_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         extracted_text = excluded.extracted_text,
+        page_data_json = coalesce(excluded.page_data_json, projects.page_data_json),
         updated_at = excluded.updated_at
     `);
-    stmt.run(id, name || 'Untitled Project', sourceType || 'text', extractedText, now, now);
+    stmt.run(id, name || 'Untitled Project', sourceType || 'text', extractedText, pageDataJson, now, now);
     return id;
   },
 
@@ -221,6 +232,7 @@ const projectRepo = {
       name: project.name,
       sourceType: project.source_type,
       extractedText: project.extracted_text,
+      pageData: project.page_data_json ? (() => { try { return JSON.parse(project.page_data_json); } catch (_) { return null; } })() : null,
       createdAt: project.created_at,
       intelligence: intel
         ? {

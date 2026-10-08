@@ -72,55 +72,140 @@ async function generatePDF({ title = 'OFFICIAL ADVISORY', content = '' }) {
       // ----------------------------------------------------
       doc.font('Times-Roman').fontSize(11).fillColor('#1e293b');
 
-      const rawLines = content.split('\n').map(l => l.trim()).filter(Boolean);
-      let paragraphCounter = 1;
+      const rawLines = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      let inTable = false;
+      const tableRows = [];
+
+      const flushTable = () => {
+        if (tableRows.length === 0) { inTable = false; return; }
+        // Render key-value metadata table as bordered box pairs
+        const colW = (doc.page.width - 108) / 2;
+        for (const row of tableRows) {
+          const yPos = doc.y;
+          // Key cell (navy background)
+          doc.rect(54, yPos, colW, 18).fill('#1A365D');
+          doc.fillColor('#FFFFFF').font('Times-Bold').fontSize(9)
+            .text(row.key, 58, yPos + 5, { width: colW - 8, lineBreak: false });
+          // Value cell (light bg)
+          doc.rect(54 + colW, yPos, colW, 18).fill('#EFF2F7').stroke('#CBD5E0');
+          doc.fillColor('#1A202C').font('Times-Roman').fontSize(9)
+            .text(row.val, 54 + colW + 4, yPos + 5, { width: colW - 8, lineBreak: false });
+          doc.y = yPos + 20;
+        }
+        doc.moveDown(0.8);
+        tableRows.length = 0;
+        inTable = false;
+      };
 
       for (let i = 0; i < rawLines.length; i++) {
         const line = rawLines[i];
 
-        // Skip headers or slide markers
-        if (line.startsWith('#') || /^Slide\s+\d+/i.test(line)) {
-          const cleanHeading = line.replace(/^#{1,6}\s*/, '').replace(/^Slide\s+\d+:?\s*/i, '');
-          if (cleanHeading && !cleanHeading.toLowerCase().includes('advisory')) {
-            doc.moveDown(0.8);
-            doc.font('Times-Bold').fontSize(12).fillColor('#0f172a').text(cleanHeading, { align: 'left' });
-            doc.font('Times-Roman').fontSize(11).fillColor('#1e293b');
-            doc.moveDown(0.4);
-          }
+        // Horizontal rule --- → divider line
+        if (/^---+$/.test(line)) {
+          if (inTable) flushTable();
+          doc.moveDown(0.5);
+          doc.lineWidth(0.5).strokeColor('#94a3b8')
+            .moveTo(54, doc.y).lineTo(doc.page.width - 54, doc.y).stroke();
+          doc.moveDown(0.8);
           continue;
         }
 
-        if (line.match(/^[\*\-•]?\s*Speaker Notes?:/i)) continue;
+        // Markdown table row: | key | value |
+        if (line.startsWith('|')) {
+          const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+          // Skip separator rows like |---|---|
+          if (cells.every(c => /^[-:]+$/.test(c))) continue;
+          if (cells.length >= 2) {
+            const key = cells[0].replace(/\*+/g, '').trim();
+            const val = cells[1].replace(/\*+/g, '').trim();
+            if (key && val) {
+              tableRows.push({ key, val });
+              inTable = true;
+              continue;
+            }
+          }
+        } else if (inTable) {
+          flushTable();
+        }
 
-        // Numbered official paragraph formatting (1st paragraph unnumbered, subsequent paragraphs 2, 3, 4...)
+        // Major section header ## 1.0 TITLE
+        if (line.startsWith('## ')) {
+          const heading = line.replace(/^#+\s*/, '').toUpperCase();
+          doc.moveDown(1.0);
+          // Navy bar
+          const barY = doc.y;
+          doc.rect(54, barY, doc.page.width - 108, 22).fill('#1A365D');
+          doc.fillColor('#FFFFFF').font('Times-Bold').fontSize(12)
+            .text(heading, 60, barY + 6, { width: doc.page.width - 120 });
+          doc.y = barY + 28;
+          doc.moveDown(0.4);
+          doc.fillColor('#1e293b').font('Times-Roman').fontSize(11);
+          continue;
+        }
+
+        // Document title # HEADING
+        if (line.startsWith('# ')) {
+          const heading = line.replace(/^#+\s*/, '');
+          doc.moveDown(0.5);
+          doc.font('Times-Bold').fontSize(14).fillColor('#0f172a')
+            .text(heading.toUpperCase(), { align: 'center' });
+          doc.moveDown(1.0);
+          doc.fillColor('#1e293b').font('Times-Roman').fontSize(11);
+          continue;
+        }
+
+        // Sub-heading ### or ####
+        if (line.startsWith('#')) {
+          const heading = line.replace(/^#+\s*/, '').replace(/\*\*/g, '').trim();
+          doc.moveDown(0.6);
+          doc.font('Times-Bold').fontSize(12).fillColor('#0f172a').text(heading);
+          doc.font('Times-Roman').fontSize(11).fillColor('#1e293b');
+          doc.moveDown(0.4);
+          continue;
+        }
+
+        // Skip speaker notes and slide markers
+        if (/^(speaker notes?:|slide\s+\d+)/i.test(line)) continue;
+
         let formattedLine = line.replace(/^[-*•·]\s*/, '').replace(/\*\*/g, '').trim();
         if (!formattedLine) continue;
 
-        let prefix = '';
-        if (paragraphCounter > 1) {
-          prefix = `${paragraphCounter}.  `;
+        // Numbered clause (e.g. 1.1, 2.3, 4.2)
+        const clauseMatch = formattedLine.match(/^(\d+\.\d+)\s+(.+)$/);
+        if (clauseMatch) {
+          const clauseNum = clauseMatch[1];
+          const clauseText = clauseMatch[2].trim();
+          // Check for page overflow
+          if (doc.y > doc.page.height - 100) doc.addPage();
+          doc.font('Times-Bold').text(clauseNum + '  ', { continued: true });
+          doc.font('Times-Roman').text(clauseText, { align: 'justify', lineGap: 2 });
+          doc.moveDown(0.7);
+          continue;
         }
-        paragraphCounter++;
 
-        // Bold emphasis for key terms (e.g. "Mobile Numbers:", "Email:")
+        // Bold label: value line
         const colonIdx = formattedLine.indexOf(':');
-        if (colonIdx > 0 && colonIdx < 30) {
+        if (colonIdx > 0 && colonIdx < 35) {
           const label = formattedLine.substring(0, colonIdx + 1);
           const rest = formattedLine.substring(colonIdx + 1).trim();
-
-          doc.font('Times-Bold').text(prefix + label + ' ', { continued: true, align: 'justify' });
-          doc.font('Times-Roman').text(rest, { align: 'justify' });
+          if (doc.y > doc.page.height - 100) doc.addPage();
+          doc.font('Times-Bold').text(label + ' ', { continued: !!rest });
+          if (rest) doc.font('Times-Roman').text(rest, { align: 'justify', lineGap: 2 });
+          doc.moveDown(0.7);
         } else {
-          doc.font('Times-Roman').text(prefix + formattedLine, { align: 'justify', lineGap: 3 });
+          if (doc.y > doc.page.height - 100) doc.addPage();
+          doc.font('Times-Roman').text(formattedLine, { align: 'justify', lineGap: 3 });
+          doc.moveDown(0.7);
         }
-
-        doc.moveDown(0.8);
       }
 
-      // ----------------------------------------------------
-      // OFFICIAL FOOTER DIVIDER & DOTS
-      // ----------------------------------------------------
+      if (inTable) flushTable();
+
+      // Official footer
       doc.moveDown(1.5);
+      doc.lineWidth(0.5).strokeColor('#94a3b8')
+        .moveTo(54, doc.y).lineTo(doc.page.width - 54, doc.y).stroke();
+      doc.moveDown(0.5);
       doc.font('Times-Bold').fontSize(12).fillColor('#475569').text('*   *   *', { align: 'center' });
 
       doc.end();
@@ -429,7 +514,27 @@ async function generatePptx({ title = 'Government Briefing Deck', content = '' }
     .map(s => s.trim())
     .filter(Boolean);
 
-  const slideSections = rawSections.length > 0 ? rawSections : [content];
+  const MIN_CONTENT_SLIDES = 7;
+  let slideSections = rawSections.length > 0 ? rawSections : [content];
+
+  // Pad to minimum 7 content slides (+ title slide = 8 total in deck)
+  const PLACEHOLDER_SECTIONS = [
+    `### Additional Context\n**Title:** Supporting Intelligence\n- Additional context and supporting data will be added as intelligence is verified.\n- This section is reserved for supplementary operational findings.\n**Speaker Notes:** Placeholder slide — fill with additional verified intelligence.`,
+    `### Risk Assessment\n**Title:** Risk Assessment & Exposure\n- Ongoing risk assessment is being conducted across all affected systems.\n- Exposure levels are being continuously monitored and updated.\n**Speaker Notes:** Reserved for dynamic risk scoring data.`,
+    `### Stakeholder Actions\n**Title:** Stakeholder Action Register\n- All stakeholder departments are directed to acknowledge and action this briefing.\n- Responsible officers must confirm receipt and initiate response protocols.\n**Speaker Notes:** Track stakeholder acknowledgement and response status.`,
+    `### Timeline & Chronology\n**Title:** Incident / Policy Timeline\n- A detailed chronological timeline is under development.\n- Key milestones and response actions will be logged here.\n**Speaker Notes:** Reserved for timeline visualization.`,
+    `### Compliance & Governance\n**Title:** Compliance & Governance Framework\n- All actions must comply with applicable cybersecurity frameworks and national standards.\n- CERT-In guidelines and IT Act 2000 provisions are applicable.\n**Speaker Notes:** Governance and compliance reference slide.`,
+    `### Resource Allocation\n**Title:** Resource & Budget Allocation\n- Dedicated resources and funding are being prioritized for incident response.\n- Inter-agency coordination and resource sharing protocols are activated.\n**Speaker Notes:** Resource planning and budget slide.`,
+    `### Document Control\n**Title:** Document Control & Version History\n- This document is subject to version control and periodic review.\n- Amendments must be authorized by the Issuing Authority.\n**Speaker Notes:** Document governance and control information.`,
+  ];
+
+  if (slideSections.length < MIN_CONTENT_SLIDES) {
+    const needed = MIN_CONTENT_SLIDES - slideSections.length;
+    for (let p = 0; p < needed; p++) {
+      slideSections.push(PLACEHOLDER_SECTIONS[p % PLACEHOLDER_SECTIONS.length]);
+    }
+  }
+
   const totalSlides = slideSections.length;
 
   for (let i = 0; i < totalSlides; i++) {

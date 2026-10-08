@@ -50,5 +50,8 @@ REGENERATION RULES:
 1. Fix all unsupported claims by either grounding them directly in the source text or removing them.
 2. Add any missing required sections or fields required for ${outputType}.
 3. Maintain clear Markdown formatting: headings on their own lines, bullet lists formatted cleanly with '- '.
-4. Return ONLY the complete improved Markdown content. Do not include meta-commentary, apologies, or explanations.`;
+4. FILTER NOISE: Strip page numbers, headers, footers, disclaimers, and boilerplate meta-commentary from your output.
+5. SENTENCE RECONSTRUCTION: Join any broken sentence fragments into complete, coherent sentences.
+6. POLISHED SUMMARIZATION: Rephrase raw source lines into executive-ready prose. NEVER copy fragmented source lines word-for-word.
+7. Return ONLY the complete improved Markdown content. Do not include meta-commentary, apologies, or explanations.`;
 };

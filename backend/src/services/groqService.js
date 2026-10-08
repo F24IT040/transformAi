@@ -1,10 +1,18 @@
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+/**
+ * Hybrid Model Routing:
+ *  MAP (bullet extraction per chunk) — fast, high-RPM model
+ *  REDUCE (final synthesis) — high-tier reasoning model
+ */
+const MAP_MODEL = process.env.FAST_MODEL || 'openai/gpt-oss-20b';
+const REDUCE_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+
 const DEFAULT_MODEL_CASCADE = [
-  process.env.GROQ_MODEL || 'qwen/qwen3.6-27b',
-  'qwen/qwen3.6-27b',
-  'openai/gpt-oss-20b',
+  process.env.GROQ_MODEL || REDUCE_MODEL,
   'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'qwen/qwen3.6-27b',
   'qwen/qwen3.8-27b',
 ];
 
@@ -12,6 +20,7 @@ const DEFAULT_MODEL_CASCADE = [
 let lastCallTimestamp = 0;
 
 const { processLLMResponse } = require('./responseProcessor');
+const mapExtractPrompt = require('../prompts/generation/mapExtract');
 
 async function callSingleModel(model, prompt) {
   // Proactive token pacing: enforce 1.2s delay between consecutive calls to avoid TPM spikes
@@ -31,7 +40,7 @@ async function callSingleModel(model, prompt) {
     body: JSON.stringify({
       model,
       temperature: 0.3,
-      max_completion_tokens: 1000,
+      max_completion_tokens: 3000,
       messages: [
         {
           role: 'system',
@@ -81,6 +90,46 @@ async function callSingleModel(model, prompt) {
   return processed.cleanedContent;
 }
 
+/**
+ * MAP Step: Extract clean bullet facts from a single chunk using the fast model.
+ * Called in parallel for each chunk in the Map-Reduce pipeline.
+ *
+ * @param {{ content: string, index: number }} chunk - A source chunk object
+ * @param {number} total - Total number of chunks (for prompt context)
+ * @returns {Promise<string>} - Bullet list string or empty string on failure
+ */
+async function generateMapStep(chunk, total) {
+  if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY.trim().length < 10) {
+    return ''; // Skip map step in mock mode
+  }
+
+  const prompt = mapExtractPrompt({
+    chunk: chunk.content,
+    index: chunk.index,
+    total,
+  });
+
+  // Try MAP_MODEL first, fall back to first REDUCE model
+  const modelsToTry = [MAP_MODEL, REDUCE_MODEL];
+
+  for (const model of modelsToTry) {
+    try {
+      console.log(`[Groq MAP] Chunk ${chunk.index}/${total} → ${model}`);
+      const result = await callSingleModel(model, prompt);
+      if (result && result.trim().length > 10) {
+        // Skip chunks that returned the "no facts" placeholder
+        if (result.includes('[No substantive facts in this chunk]')) {
+          return '';
+        }
+        return result.trim();
+      }
+    } catch (err) {
+      console.warn(`[Groq MAP] Chunk ${chunk.index} failed on ${model}: ${err.message}`);
+    }
+  }
+  return ''; // Return empty on all failures — REDUCE step still proceeds
+}
+
 async function generateWithGroq({ prompt }) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error('GROQ_API_KEY is not configured. Add it to backend/.env.');
@@ -116,4 +165,4 @@ async function generateWithGroq({ prompt }) {
   throw new Error(`Groq generation failed across models: ${lastError?.message || 'Rate limit or empty response'}`);
 }
 
-module.exports = { generateWithGroq };
+module.exports = { generateWithGroq, generateMapStep, MAP_MODEL, REDUCE_MODEL };

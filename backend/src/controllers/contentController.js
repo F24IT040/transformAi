@@ -27,7 +27,26 @@ async function extractPdfText(buffer) {
     const result = await parser.getText();
     const text = result.text || '';
     if (!text.trim()) throw new Error('No selectable text found in this PDF (may be scanned image).');
-    return text;
+
+    // Page-aware extraction: { page, section, text }[]
+    const pageData = (result.pages || []).map((p, idx) => {
+      const pageNum = p.num || idx + 1;
+      const pageText = p.text || '';
+      // Section detection: scan first line of each page for heading patterns
+      const firstLine = pageText.trim().split('\n')[0] || '';
+      const sectionMatch = firstLine.match(/^(?:#+\s*|[A-Z0-9.\-\s]{3,40}:|[0-9]+\.\s+)?([A-Za-z0-9\s\-_]{3,50})/);
+      const section = sectionMatch && firstLine.length < 80 ? sectionMatch[1].trim() : '';
+      return {
+        page: pageNum,
+        section,
+        text: pageText,
+      };
+    });
+
+    return {
+      text,
+      pageData: pageData.length > 0 ? pageData : [{ page: 1, section: '', text }],
+    };
   } finally {
     await parser.destroy();
   }
@@ -149,6 +168,7 @@ const contentController = {
   async processSource(req, res) {
     try {
       let extractedText = '';
+      let pageData = null;
       let sourceType = 'text';
       let fileName = 'Pasted Text';
 
@@ -156,12 +176,22 @@ const contentController = {
         fileName = req.file.originalname;
         const extension = fileName.toLowerCase().split('.').pop();
         sourceType = extension;
-        if (extension === 'txt') extractedText = req.file.buffer.toString('utf8');
-        else if (extension === 'pdf') extractedText = await extractPdfText(req.file.buffer);
-        else if (extension === 'docx') extractedText = await extractDocxText(req.file.buffer);
-        else return res.status(400).json({ success: false, error: 'Supported formats: .txt, .pdf, .docx' });
+        if (extension === 'txt') {
+          extractedText = req.file.buffer.toString('utf8');
+        } else if (extension === 'pdf') {
+          const pdfResult = await extractPdfText(req.file.buffer);
+          extractedText = typeof pdfResult === 'string' ? pdfResult : pdfResult.text;
+          pageData = pdfResult.pageData || null;
+        } else if (extension === 'docx') {
+          extractedText = await extractDocxText(req.file.buffer);
+        } else {
+          return res.status(400).json({ success: false, error: 'Supported formats: .txt, .pdf, .docx' });
+        }
       } else if (typeof req.body.sourceText === 'string') {
         extractedText = req.body.sourceText;
+        if (Array.isArray(req.body.pageData)) {
+          pageData = req.body.pageData;
+        }
       } else {
         return res.status(400).json({ success: false, error: 'Provide sourceText string or a sourceFile.' });
       }
@@ -169,12 +199,21 @@ const contentController = {
       const cleaned = cleanText(extractedText);
       if (!cleaned) return res.status(422).json({ success: false, error: 'No readable text found in source.' });
 
+      // Clean per-page text if pageData is available
+      if (pageData && Array.isArray(pageData)) {
+        pageData = pageData.map(p => ({
+          ...p,
+          text: cleanText(p.text || ''),
+        }));
+      }
+
       const projectId = req.body.projectId || `proj_${Date.now()}`;
       projectRepo.saveProject({
         id: projectId,
         name: fileName,
         sourceType,
         extractedText: cleaned,
+        pageData,
       });
 
       res.json({
@@ -182,6 +221,7 @@ const contentController = {
         projectId,
         sourceType,
         extractedText: cleaned,
+        pageData,
         characterCount: cleaned.length,
         wordCount: cleaned.split(/\s+/).filter(Boolean).length,
       });
@@ -249,12 +289,15 @@ ${cleaned}`;
 
       // Ensure project record exists in SQLite database
       const existingProj = projectRepo.getProject(effectiveProjectId);
+      const pageData = req.body.pageData || existingProj?.pageData || null;
+
       if (!existingProj) {
         projectRepo.saveProject({
           id: effectiveProjectId,
           name: settings?.title || 'Transformation Project',
           sourceType: 'text',
           extractedText: cleanedSource,
+          pageData,
         });
       }
 
@@ -270,6 +313,7 @@ ${cleaned}`;
         settings,
         projectId: effectiveProjectId,
         intelligence,
+        pageData,
       });
 
       // Save all outputs and evaluations into SQLite database
@@ -308,6 +352,7 @@ ${cleaned}`;
         verifications: loopResult.verifications,
         loopStatus: loopResult.loopStatus,
         analysis: loopResult.analysis,
+        intelligenceMetadata: loopResult.intelligenceMetadata || null,
       });
     } catch (error) {
       console.error('Generation failed:', error.message);
